@@ -1,7 +1,9 @@
 Notice
 ------
 
-We are currently using this fork of *hangups* as a submodule of **BastardBot**, a bot to interact with Google Hangouts conversations. [Check it out!](https://github.com/elamperti/bastardbot)
+We are currently using this fork of *hangups* as a submodule of **BastardBot**, a bot to interact with Google Hangouts conversations. `Check it out!`_
+
+.. _Check it out!: https://github.com/elamperti/bastardbot
 
 
 ----
