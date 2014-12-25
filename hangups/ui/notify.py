@@ -11,14 +11,37 @@ import html
 import logging
 import re
 import subprocess
+import sys
+
+import hangups
+from hangups.ui.utils import get_conv_name
 
 logger = logging.getLogger(__name__)
-NOTIFY_CMD = [
-    'gdbus', 'call', '--session', '--dest', 'org.freedesktop.Notifications',
-    '--object-path', '/org/freedesktop/Notifications', '--method',
-    'org.freedesktop.Notifications.Notify', 'hangups', '{replaces_id}', '',
-    '{sender_name}', '{msg_text}', '[]', '{{}}', ' -1'
-]
+if sys.platform == 'darwin':
+    NOTIFY_CMD = [
+        'osascript', '-e',
+        ('display notification "{msg_text}" with '
+         'title "{convo_name}" '
+         'subtitle "{sender_name}"'),
+    ]
+    NOTIFY_ESCAPER = lambda s: s.replace('"', '\\"')
+else:
+    NOTIFY_CMD = [
+        'gdbus', 'call', '--session', '--dest',
+        'org.freedesktop.Notifications', '--object-path',
+        '/org/freedesktop/Notifications', '--method',
+        'org.freedesktop.Notifications.Notify', 'hangups', '{replaces_id}', '',
+        '{sender_name}', '{msg_text}', '[]', '{{}}', ' -1'
+    ]
+    def NOTIFY_ESCAPER(text):
+        """Escape text for passing into gdbus."""
+        # Prevent the notifier from interpreting markup:
+        res = html.escape(text, quote=False)
+        # Prevent issues with how gdbus parses gvariants:
+        res = res.replace('\\', '\\\\')
+        res = res.replace('"', '\\u0022')
+        res = res.replace('\'', '\\u0027')
+        return res
 RESULT_RE = re.compile(r'\(uint32 ([\d]+),\)')
 
 
@@ -33,21 +56,23 @@ class Notifier(object):
 
     def __init__(self, conv_list):
         self._conv_list = conv_list  # hangups.ConversationList
-        self._conv_list.on_message.add_observer(self._on_message)
+        self._conv_list.on_event.add_observer(self._on_event)
         self._replaces_id = 0
 
-    def _on_message(self, chat_message):
+    def _on_event(self, conv_event):
         """Create notification for new messages."""
-        conv = self._conv_list.get(chat_message.conv_id)
-        user = conv.get_user(chat_message.user_id)
-        # Ignore messages sent by yourself.
-        if not user.is_self:
+        conv = self._conv_list.get(conv_event.conversation_id)
+        user = conv.get_user(conv_event.user_id)
+        # Ignore non-messages or messages sent by yourself.
+        if (not user.is_self and
+                isinstance(conv_event, hangups.ChatMessageEvent)):
             # We have to escape angle brackets because freedesktop.org
             # notifications support markup.
             cmd = [arg.format(
-                sender_name=html.escape(user.full_name, quote=False),
-                msg_text=html.escape(chat_message.text, quote=False),
+                sender_name=NOTIFY_ESCAPER(user.full_name),
+                msg_text=NOTIFY_ESCAPER(conv_event.text),
                 replaces_id=self._replaces_id,
+                convo_name=NOTIFY_ESCAPER(get_conv_name(conv)),
             ) for arg in NOTIFY_CMD]
 
             # Run the notification and parse out the replaces_id. Since the

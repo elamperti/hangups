@@ -5,7 +5,10 @@ API responses. This is only as complete as necessary to parse the responses
 we're getting.
 """
 
+import logging
 import purplex
+
+logger = logging.getLogger(__name__)
 
 
 def loads(string):
@@ -19,18 +22,19 @@ def loads(string):
         raise ValueError('Failed to load JavaScript: {}'.format(e))
 
 
-# TODO: there are more possible escape sequences
 _ESCAPES = {
-    "'": "'",
-    '"': '"',
-    '\\': '\\',
-    'n': '\n',
+    'b': '\b',
     't': '\t',
+    'n': '\n',
+    'v': '\v',
+    'f': '\f',
     'r': '\r',
-    'u': '', # unicode escapes are a special case
+    '"': '"',
+    "'": "'",
+    '\\': '\\',
+    # Unicode escapes are a special case:
+    'u': '',
 }
-_STRING_RE = ('(\'(([^\\\\\'])|(\\\\[{0}]))*?\')|("(([^\\\\"])|(\\\\[{0}]))*?")'
-              .format(''.join(_ESCAPES.keys()).replace('\\', '\\\\')))
 
 
 def _unescape_string(s):
@@ -48,25 +52,42 @@ def _unescape_string(s):
                 raise ValueError('Reached end of string literal '
                                  'prematurely: {}'.format(s))
             if c == 'u':
+                # One character can be formed from multiple contiguous \u
+                # escape sequences.
+                char_hex = ''
+                while True:
+                    try:
+                        char_hex += ''.join([chars.pop(0) for _ in range(4)])
+                    except IndexError:
+                        raise ValueError('Reached end of string literal '
+                                         'prematurely: {}'.format(s))
+                    if len(chars) > 1 and ''.join(chars[0:2]) == r'\u':
+                        chars.pop(0)
+                        chars.pop(0)
+                    else:
+                        break
                 try:
-                    unescaped_chars.append(
-                        chr(int(''.join([chars.pop(0) for _ in range(4)]), 16))
-                    )
-                except IndexError:
-                    raise ValueError('Reached end of string literal '
-                                     'prematurely: {}'.format(s))
+                    char = bytes.fromhex(char_hex).decode('utf-16be')
+                except (ValueError, UnicodeDecodeError) as e:
+                    logger.warning('Failed to decode unicode escape: {}'
+                                   .format(e))
+                    char = ''
+                unescaped_chars.extend(char)
             else:
                 try:
                     unescaped_chars.append(_ESCAPES[c])
                 except KeyError:
-                    raise ValueError('String literal contains invalid '
-                                     'escape sequence: {}'.format(s))
+                    # Mimic browser engines by ignoring the backslash if it
+                    # forms an invalid escape sequence.
+                    logger.warning('Ignoring invalid escape sequence: \\{}'
+                                   .format(c))
+                    unescaped_chars.append(c)
     return "".join(unescaped_chars)
 
 
 class JavaScriptLexer(purplex.Lexer):
     """Lexer for a subset of JavaScript."""
-    # TODO negatives? floats?
+    # TODO: Negative integers
     INTEGER = purplex.TokenDef(r'\d+')
     FLOAT = purplex.TokenDef(r'[-+]?\d*[.]\d+')
 
@@ -81,7 +102,9 @@ class JavaScriptLexer(purplex.Lexer):
     COMMA = purplex.TokenDef(r',')
     COLON = purplex.TokenDef(r':')
 
-    STRING = purplex.TokenDef(_STRING_RE)
+    STRING = purplex.TokenDef(
+        '(\'(([^\\\\\'])|(\\\\.))*?\')|("(([^\\\\"])|(\\\\.))*?")'
+    )
     # TODO more unquoted keys are allowed
     KEY = purplex.TokenDef(r'[a-zA-Z0-9_$]+')
 
