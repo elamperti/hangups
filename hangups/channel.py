@@ -4,23 +4,46 @@ Hangouts receives events using a system that appears very close to an App
 Engine Channel.
 """
 
-from tornado import gen, httpclient
+import aiohttp
+import asyncio
+import hashlib
 import logging
 import re
+import time
 
-from hangups import javascript, http_utils, event
+from hangups import javascript, http_utils, event, exceptions
 
 logger = logging.getLogger(__name__)
 LEN_REGEX = re.compile(r'([0-9]+)\n', re.MULTILINE)
-# Set the connection and request timeouts low so we fail fast when there's a
-# network problem.
-CONNECT_TIMEOUT = 10
-REQUEST_TIMEOUT = 10
-# Long-polling requests may last ~3-4 minutes.
-LP_REQ_TIMEOUT = 60 * 5
+ORIGIN_URL = 'https://talkgadget.google.com'
+CHANNEL_URL_PREFIX = 'https://0.client-channel.google.com/client-channel/{}'
+CONNECT_TIMEOUT = 30
 # Long-polling requests send heartbeats every 15 seconds, so if we miss two in
 # a row, consider the connection dead.
-LP_DATA_TIMEOUT = 30
+PUSH_TIMEOUT = 30
+MAX_READ_BYTES = 1024 * 1024
+
+
+class UnknownSIDError(exceptions.HangupsError):
+
+    """hangups channel session expired."""
+
+    pass
+
+
+def get_authorization_headers(sapisid_cookie):
+    """Return authorization headers for API request."""
+    # It doesn't seem to matter what the url and time are as long as they are
+    # consistent.
+    time_msec = int(time.time() * 1000)
+    auth_string = '{} {} {}'.format(time_msec, sapisid_cookie, ORIGIN_URL)
+    auth_hash = hashlib.sha1(auth_string.encode()).hexdigest()
+    sapisidhash = 'SAPISIDHASH {}_{}'.format(time_msec, auth_hash)
+    return {
+        'authorization': sapisidhash,
+        'x-origin': ORIGIN_URL,
+        'x-goog-authuser': '0',
+    }
 
 
 def _best_effort_decode(data_bytes):
@@ -93,26 +116,16 @@ class PushDataParser(object):
 def _parse_sid_response(res):
     """Parse response format for request for new channel SID.
 
-    Returns (SID, header_client, gsessionid).
+    Example format (after parsing JS):
+    [   [0,["c","SID_HERE","",8]],
+        [1,[{"gsid":"GSESSIONID_HERE"}]]]
+
+    Returns (SID, gsessionid) tuple.
     """
-    sid = None
-    header_client = None
-    gsessionid = None
-
-    p = PushDataParser()
-    res = javascript.loads(list(p.get_submissions(res))[0])
-    for segment in res:
-        num, message = segment
-        if num == 0:
-            sid = message[1]
-        elif message[0] == 'c':
-            type_ = message[1][1][0]
-            if type_ == 'cfj':
-                header_client = message[1][1][1].split('/')[1]
-            elif type_ == 'ei':
-                gsessionid = message[1][1][1]
-
-    return(sid, header_client, gsessionid)
+    res = javascript.loads(list(PushDataParser().get_submissions(res))[0])
+    sid = res[0][1][1]
+    gsessionid = res[1][1][0]['gsid']
+    return (sid, gsessionid)
 
 
 class Channel(object):
@@ -123,7 +136,7 @@ class Channel(object):
     # Public methods
     ##########################################################################
 
-    def __init__(self, cookies, path, clid, ec, prop):
+    def __init__(self, cookies, connector):
         """Create a new channel."""
 
         # Event fired when channel connects with arguments ():
@@ -144,22 +157,19 @@ class Channel(object):
         self._cookies = cookies
         # Parser for assembling messages:
         self._push_parser = None
-
-        # Static channel parameters:
-        # '/u/0/talkgadget/_/channel/'
-        self._channel_path = path
-        # 'A672C650270E1674'
-        self._clid_param = clid
-        # '["ci:ec",1,1,0,"chat_wcs_20140813.110045_RC2"]\n'
-        self._ec_param = ec
-        # 'aChromeExtension'
-        self._prop_param = prop
+        # aiohttp connector for keep-alive:
+        self._connector = connector
 
         # Discovered parameters:
         self._sid_param = None
         self._gsessionid_param = None
 
-    @gen.coroutine
+    @property
+    def is_connected(self):
+        """Whether the client is currently connected."""
+        return self._is_connected
+
+    @asyncio.coroutine
     def listen(self):
         """Listen for messages on the channel.
 
@@ -177,45 +187,27 @@ class Channel(object):
                 backoff_seconds = 2 ** (MAX_RETRIES - retries)
                 logger.info('Backing off for {} seconds'
                             .format(backoff_seconds))
-                yield http_utils.sleep(backoff_seconds)
+                yield from asyncio.sleep(backoff_seconds)
 
             # Request a new SID if we don't have one yet, or the previous one
             # became invalid.
             if need_new_sid:
                 # TODO: error handling
-                yield self._fetch_channel_sid()
+                yield from self._fetch_channel_sid()
                 need_new_sid = False
             # Clear any previous push data, since if there was an error it
             # could contain garbage.
             self._push_parser = PushDataParser()
             try:
-                yield self._longpoll_request()
-            except IOError as e:
-                # An error occurred, so decrement the number of retries.
+                yield from self._longpoll_request()
+            except (UnknownSIDError, exceptions.NetworkError) as e:
+                logger.warning('Long-polling request failed: {}'.format(e))
                 retries -= 1
                 if self._is_connected:
                     self._is_connected = False
-                    self.on_disconnect.fire()
-                logger.warning('Long-polling request failed because of '
-                               'IOError: {}'.format(e))
-            except httpclient.HTTPError as e:
-                # An error occurred, so decrement the number of retries.
-                retries -= 1
-                if self._is_connected:
-                    self._is_connected = False
-                    self.on_disconnect.fire()
-                if e.code == 400 and e.response.reason == 'Unknown SID':
-                    logger.warning('Long-polling request failed because SID '
-                                   'became invalid. Will attempt to recover.')
+                    yield from self.on_disconnect.fire()
+                if isinstance(e, UnknownSIDError):
                     need_new_sid = True
-                elif e.code == 599:
-                    logger.warning('Long-polling request failed because '
-                                   'connection was closed. Will attempt to '
-                                   'recover.')
-                else:
-                    logger.warning('Long-polling request failed for unknown '
-                                   'reason: {}'.format(e))
-                    break # Do not retry.
             else:
                 # The connection closed successfully, so reset the number of
                 # retries.
@@ -230,63 +222,139 @@ class Channel(object):
     # Private methods
     ##########################################################################
 
-    @gen.coroutine
+    @asyncio.coroutine
     def _fetch_channel_sid(self):
-        """Request a new session ID for the push channel."""
-        logger.info('Requesting new session...')
-        url = 'https://talkgadget.google.com{}bind'.format(self._channel_path)
-        params = {
-            'VER': 8,
-            'clid': self._clid_param,
-            'ec': self._ec_param,
-            'RID': 81187, # TODO: "request ID"? should probably increment
-            # Required if we want our client to be called "AChromeExtension":
-            'prop': self._prop_param,
-        }
-        res = yield http_utils.fetch(
-            url, method='POST', cookies=self._cookies, params=params,
-            data='count=0', connect_timeout=CONNECT_TIMEOUT,
-            request_timeout=REQUEST_TIMEOUT
+        """Creates a new channel for receiving push data.
+
+        Raises hangups.NetworkError if the channel can not be created.
+        """
+        logger.info('Requesting new gsessionid and SID...')
+        # There's a separate API to get the gsessionid alone that Hangouts for
+        # Chrome uses, but if we don't send a gsessionid with this request, it
+        # will return a gsessionid as well as the SID.
+        res = yield from http_utils.fetch(
+            'post', CHANNEL_URL_PREFIX.format('channel/bind'),
+            cookies=self._cookies, data='count=0', connector=self._connector,
+            headers=get_authorization_headers(self._cookies['SAPISID']),
+            params={
+                'VER': 8,
+                'RID': 81187,
+                'ctype': 'hangouts',  # client type
+            }
         )
-        logger.debug('Fetch SID response:\n{}'.format(res.body))
-        if res.code != 200:
-            # TODO use better exception
-            raise ValueError("SID fetch request failed with {}: {}"
-                             .format(res.code, res.raw.read()))
-        # TODO: handle errors here
-        self._sid_param, _, self._gsessionid_param = (
-            _parse_sid_response(res.body)
-        )
+        self._sid_param, self._gsessionid_param = _parse_sid_response(res.body)
         logger.info('New SID: {}'.format(self._sid_param))
         logger.info('New gsessionid: {}'.format(self._gsessionid_param))
 
-    @gen.coroutine
-    def _longpoll_request(self):
-        """Open a long-polling request to receive push events.
+        logger.info('Setting up channel (1/2)...')
+        # Tell the channel what kinds of events to subscribe to. It's possible
+        # to combine this request with the subsequent one, but it doesn't work
+        # reliably.
+        timestamp = str(int(time.time() * 1000))
+        res = yield from http_utils.fetch(
+            'post', CHANNEL_URL_PREFIX.format('channel/bind'),
+            cookies=self._cookies, connector=self._connector,
+            headers=get_authorization_headers(self._cookies['SAPISID']),
+            params={
+                'VER': 8,
+                'RID': 81188,
+                'ctype': 'hangouts',  # client type
+                'gsessionid': self._gsessionid_param,
+                'SID': self._sid_param,
+            },
+            data={
+                'count': 1,
+                'ofs': 0,
+                'req0_p': ('{"1":{"1":{"1":{"1":3,"2":2}},"2":{"1":{"1":3,"2":'
+                           '2},"2":"","3":"JS","4":"lcsclient"},"3":' +
+                           timestamp + ',"4":0,"5":"c1"},"2":{}}'),
+            },
+        )
 
-        Raises HTTPError or IOError.
+        logger.info('Setting up channel (2/2)...')
+        res = yield from http_utils.fetch(
+            'post', CHANNEL_URL_PREFIX.format('channel/bind'),
+            cookies=self._cookies, connector=self._connector,
+            headers=get_authorization_headers(self._cookies['SAPISID']),
+            params={
+                'VER': 8,
+                'RID': 81189,
+                'ctype': 'hangouts',  # client type
+                'gsessionid': self._gsessionid_param,
+                'SID': self._sid_param,
+            },
+            data={
+                'count': 2,
+                'ofs': 1,
+                'req0_p': ('{"1":{"1":{"1":{"1":3,"2":2}},"2":{"1":{"1":3,"2":'
+                           '2},"2":"","3":"JS","4":"lcsclient"},"3":' +
+                           timestamp + ',"4":' + timestamp +
+                           ',"5":"c3"},"3":{"1":{"1":"babel"}}}'),
+                'req1_p': ('{"1":{"1":{"1":{"1":3,"2":2}},"2":{"1":{"1":3,"2":'
+                           '2},"2":"","3":"JS","4":"lcsclient"},"3":' +
+                           timestamp + ',"4":' + timestamp +
+                           ',"5":"c4"},"3":{"1":{"1":"hangout_invite"}}}'),
+            },
+        )
+
+    @asyncio.coroutine
+    def _longpoll_request(self):
+        """Open a long-polling request and receive push data.
+
+        This method uses keep-alive to make re-opening the request faster, but
+        the remote server will set the "Connection: close" header once an hour.
+
+        Raises hangups.NetworkError or UnknownSIDError.
         """
         params = {
             'VER': 8,
-            'clid': self._clid_param,
-            'prop': self._prop_param,
-            'ec': self._ec_param,
             'gsessionid': self._gsessionid_param,
             'RID': 'rpc',
             't': 1, # trial
             'SID': self._sid_param,
             'CI': 0,
+            'ctype': 'hangouts',  # client type
+            'TYPE': 'xmlhttp',
         }
-        URL = 'https://talkgadget.google.com/u/0/talkgadget/_/channel/bind'
+        headers = get_authorization_headers(self._cookies['SAPISID'])
         logger.info('Opening new long-polling request')
-        res = yield http_utils.longpoll_fetch(
-            URL, params=params, cookies=self._cookies,
-            streaming_callback=self._on_push_data,
-            connect_timeout=CONNECT_TIMEOUT, request_timeout=LP_REQ_TIMEOUT,
-            data_timeout=LP_DATA_TIMEOUT
-        )
-        return res
+        try:
+            res = yield from asyncio.wait_for(aiohttp.request(
+                'get', CHANNEL_URL_PREFIX.format('channel/bind'),
+                params=params, cookies=self._cookies, headers=headers,
+                connector=self._connector
+            ), CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise exceptions.NetworkError('Request timed out')
+        except aiohttp.errors.ConnectionError as e:
+            raise exceptions.NetworkError('Request connection error: {}'
+                                          .format(e))
+        if res.status == 400 and res.reason == 'Unknown SID':
+            raise UnknownSIDError('SID became invalid')
+        elif res.status != 200:
+            raise exceptions.NetworkError(
+                'Request return unexpected status: {}: {}'
+                .format(res.status, res.reason)
+            )
+        while True:
+            try:
+                chunk = yield from asyncio.wait_for(
+                    res.content.read(MAX_READ_BYTES), PUSH_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                raise exceptions.NetworkError('Request timed out')
+            except aiohttp.errors.ConnectionError as e:
+                raise exceptions.NetworkError('Request connection error: {}'
+                                              .format(e))
+            if chunk:
+                yield from self._on_push_data(chunk)
+            else:
+                # Close the response to allow the connection to be reused for
+                # the next request.
+                res.close()
+                break
 
+    @asyncio.coroutine
     def _on_push_data(self, data_bytes):
         """Parse push data and trigger event methods."""
         logger.debug('Received push data:\n{}'.format(data_bytes))
@@ -296,11 +364,11 @@ class Channel(object):
         if not self._is_connected:
             if self._on_connect_called:
                 self._is_connected = True
-                self.on_reconnect.fire()
+                yield from self.on_reconnect.fire()
             else:
                 self._on_connect_called = True
                 self._is_connected = True
-                self.on_connect.fire()
+                yield from self.on_connect.fire()
 
         for submission in self._push_parser.get_submissions(data_bytes):
-            self.on_message.fire(submission)
+            yield from self.on_message.fire(submission)

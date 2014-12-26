@@ -83,7 +83,7 @@ class SegmentType(enum.Enum):
     LINK = 2
 
 
-class ClientMembershipChangeType(enum.Enum):
+class MembershipChangeType(enum.Enum):
 
     """Conversation membership change type."""
 
@@ -178,7 +178,7 @@ CLIENT_CONVERSATION = Message(
         (None, Field(is_optional=True)),
         ('self_read_state', Message(
             ('participant_id', USER_ID),
-            ('last_read_timestamp', Field()),
+            ('latest_read_timestamp', Field()),
         )),
         ('status', EnumField(ClientConversationStatus)),
         ('notification_level', EnumField(ClientNotificationLevel)),
@@ -188,7 +188,7 @@ CLIENT_CONVERSATION = Message(
         ('inviter_id', USER_ID),
         ('invite_timestamp', Field()),
         ('sort_timestamp', Field(is_optional=True)),
-        ('active_timestamp', Field()),
+        ('active_timestamp', Field(is_optional=True)),
         (None, Field(is_optional=True)),
         (None, Field(is_optional=True)),
         (None, Field()),
@@ -223,32 +223,36 @@ CLIENT_CONVERSATION = Message(
     is_optional=True,
 )
 
+MESSAGE_SEGMENT = Message(
+    ('type_', EnumField(SegmentType)),
+    ('text', Field(is_optional=True)),  # Can be None for linebreaks
+    ('formatting', Message(
+        ('bold', Field(is_optional=True)),
+        ('italic', Field(is_optional=True)),
+        ('strikethrough', Field(is_optional=True)),
+        ('underline', Field(is_optional=True)),
+        is_optional=True,
+    )),
+    ('link_data', Message(
+        ('link_target', Field(is_optional=True)),
+        is_optional=True,
+    )),
+)
+
+MESSAGE_ATTACHMENT = Message(
+    ('embed_item', Message(
+        # 249 (PLUS_PHOTO), 340, 335, 0
+        ('type_', RepeatedField(Field())),
+        ('data', Field()),  # can be a dict
+    )),
+)
+
 CLIENT_CHAT_MESSAGE = Message(
     (None, Field(is_optional=True)),  # always None?
-    ('annotation', RepeatedField(Field())),  # always []?
+    ('annotation', RepeatedField(Field(), is_optional=True)),
     ('message_content', Message(
-        ('segment', RepeatedField(Message(
-            ('type_', EnumField(SegmentType)),
-            ('text', Field()),
-            ('formatting', Message(
-                ('bold', Field(is_optional=True)),
-                ('italic', Field(is_optional=True)),
-                ('strikethrough', Field(is_optional=True)),
-                ('underline', Field(is_optional=True)),
-                is_optional=True,
-            )),
-            ('link_data', Message(
-                ('link_target', Field()),
-                is_optional=True,
-            )),
-        ))),
-        ('attachment', RepeatedField(Message(
-            ('embed_item', Message(
-                # 249 (PLUS_PHOTO), 340, 335, 0
-                ('type_', RepeatedField(Field())),
-                ('data', Field()),  # can be a dict
-            )),
-        ))),
+        ('segment', RepeatedField(MESSAGE_SEGMENT, is_optional=True)),
+        ('attachment', RepeatedField(MESSAGE_ATTACHMENT, is_optional=True)),
     )),
     is_optional=True,
 )
@@ -279,7 +283,7 @@ CLIENT_OTR_MODIFICATION = Message(
 )
 
 CLIENT_MEMBERSHIP_CHANGE = Message(
-    ('type_', EnumField(ClientMembershipChangeType)),
+    ('type_', EnumField(MembershipChangeType)),
     (None, RepeatedField(Field())),
     ('participant_ids', RepeatedField(USER_ID)),
     (None, Field()),
@@ -316,6 +320,13 @@ CLIENT_EVENT_NOTIFICATION = Message(
     is_optional=True,
 )
 
+CLIENT_WATERMARK_NOTIFICATION = Message(
+    ('participant_id', USER_ID),
+    ('conversation_id', CONVERSATION_ID),
+    ('latest_read_timestamp', Field()),
+    is_optional=True,
+)
+
 CLIENT_STATE_UPDATE_HEADER = Message(
     ('active_client_state', EnumField(ActiveClientState)),
     (None, Field(is_optional=True)),
@@ -336,7 +347,7 @@ CLIENT_STATE_UPDATE = Message(
     ('typing_notification', CLIENT_SET_TYPING_NOTIFICATION),
     ('notification_level_notification', Field(is_optional=True)),
     ('reply_to_invite_notification', Field(is_optional=True)),
-    ('watermark_notification', Field(is_optional=True)),
+    ('watermark_notification', CLIENT_WATERMARK_NOTIFICATION),
     (None, Field(is_optional=True)),
     ('settings_notification', Field(is_optional=True)),
     ('view_modification', Field(is_optional=True)),
@@ -383,7 +394,7 @@ CLIENT_ENTITY = Message(
         ('display_name', Field(is_optional=True)),
         ('first_name', Field(is_optional=True)),
         ('photo_url', Field(is_optional=True)),
-        ('email', Field(is_optional=True)),
+        ('emails', RepeatedField(Field())),
     )),
 )
 
@@ -413,4 +424,25 @@ CLIENT_GET_SELF_INFO_RESPONSE = Message(
     (None, Field()),  # 'cgsirp'
     (None, Field()),  # response header
     ('self_entity', CLIENT_ENTITY),
+)
+
+CLIENT_RESPONSE_HEADER = Message(
+    ('status', Field()),  # 1 => success
+    (None, Field(is_optional=True)),
+    (None, Field(is_optional=True)),
+    ('request_trace_id', Field()),
+    ('current_server_time', Field()),
+)
+
+CLIENT_SYNC_ALL_NEW_EVENTS_RESPONSE = Message(
+    (None, Field()),  # 'csanerp'
+    ('response_header', CLIENT_RESPONSE_HEADER),
+    ('sync_timestamp', Field()),
+    ('conversation_state', RepeatedField(CLIENT_CONVERSATION_STATE)),
+)
+
+CLIENT_GET_CONVERSATION_RESPONSE = Message(
+    (None, Field()),  # 'cgcrp'
+    ('response_header', CLIENT_RESPONSE_HEADER),
+    ('conversation_state', CLIENT_CONVERSATION_STATE),
 )

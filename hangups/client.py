@@ -1,33 +1,36 @@
 """Abstract class for writing chat clients."""
 
-from tornado import gen, httpclient, ioloop
+import aiohttp
+import asyncio
 import collections
-import hashlib
 import itertools
 import json
 import logging
 import random
 import re
 import time
+import datetime
 
 from hangups import (javascript, parsers, exceptions, http_utils, channel,
                      event, schemas)
 
 logger = logging.getLogger(__name__)
 ORIGIN_URL = 'https://talkgadget.google.com'
+PVT_TOKEN_URL = 'https://talkgadget.google.com/talkgadget/_/extension-start'
 CHAT_INIT_URL = 'https://talkgadget.google.com/u/0/talkgadget/_/chat'
 CHAT_INIT_PARAMS = {
     'prop': 'aChromeExtension',
     'fid': 'gtn-roster-iframe-id',
     'ec': '["ci:ec",true,true,false]',
+    'pvt': None,  # Populated later
 }
 CHAT_INIT_REGEX = re.compile(
     r"(?:<script>AF_initDataCallback\((.*?)\);</script>)", re.DOTALL
 )
-# Set the connection and request timeouts low so we fail fast when there's a
-# network problem.
-CONNECT_TIMEOUT = 10
-REQUEST_TIMEOUT = 10
+# Timeout to send for setactiveclient requests:
+ACTIVE_TIMEOUT_SECS = 120
+# Minimum timeout between subsequent setactiveclient requests:
+SETACTIVECLIENT_LIMIT_SECS = 60
 
 
 # Initial account data received after the client is first connected:
@@ -36,6 +39,7 @@ InitialData = collections.namedtuple('InitialData', [
     'self_entity',  # ClientEntity
     'entities',  # [ClientEntity]
     'conversation_participants',  # [ClientConversationParticipantData]
+    'sync_timestamp'  # datetime
 ])
 
 
@@ -62,14 +66,9 @@ class Client(object):
         # Event fired when a ClientStateUpdate arrives with arguments
         # (state_update).
         self.on_state_update = event.Event('Client.on_state_update')
-        # Event fired when a ClientEventNotification arrives with arguments
-        # (event_notification).
-        self.on_event_notification = event.Event(
-            'Client.on_event_notification'
-        )
 
         self._cookies = cookies
-        self._sync_timestamp = None  # datetime.datetime
+        self._connector = aiohttp.TCPConnector()
 
         # hangups.channel.Channel instantiated in connect()
         self._channel = None
@@ -79,68 +78,87 @@ class Client(object):
         self._header_date = None
         self._header_version = None
         self._header_id = None
-        # TODO This one isn't being set anywhere:
-        self._header_client = None
-        # Parameters needed to create the Channel:
-        self._channel_path = None
-        self._clid = None
-        self._channel_ec_param = None
-        self._channel_prop_param = None
+        # String identifying this client:
+        self._client_id = None
+        # Account email address:
+        self._email = None
+        # Time in seconds that the client as last set as active:
+        self._last_active_secs = 0.0
+        # ActiveClientState enum value or None:
+        self._active_client_state = None
+        # Future for Channel.listen
+        self._listen_future = None
 
     ##########################################################################
     # Public methods
     ##########################################################################
 
-    @gen.coroutine
+    @asyncio.coroutine
     def connect(self):
-        """Connect to the server and receive events."""
-        initial_data = yield self._initialize_chat()
-        self._channel = channel.Channel(self._cookies, self._channel_path,
-                                        self._clid, self._channel_ec_param,
-                                        self._channel_prop_param)
-        sync_f = lambda: ioloop.IOLoop.instance().add_future(
-            self._sync_chat_messages(), lambda f: f.result()
-        )
-        self._channel.on_connect.add_observer(sync_f)
-        self._channel.on_connect.add_observer(
-            lambda: self.on_connect.fire(initial_data)
-        )
-        self._channel.on_reconnect.add_observer(sync_f)
+        """Establish a connection to the chat server.
+
+        Returns when an error has occurred, or Client.disconnect has been
+        called.
+        """
+        initial_data = yield from self._initialize_chat()
+        self._channel = channel.Channel(self._cookies, self._connector)
+        @asyncio.coroutine
+        def _on_connect():
+            """Wrapper to fire on_connect with initial_data."""
+            yield from self.on_connect.fire(initial_data)
+        self._channel.on_connect.add_observer(_on_connect)
         self._channel.on_reconnect.add_observer(self.on_reconnect.fire)
         self._channel.on_disconnect.add_observer(self.on_disconnect.fire)
         self._channel.on_message.add_observer(self._on_push_data)
-        yield self._channel.listen()
+
+        self._listen_future = asyncio.async(self._channel.listen())
+        try:
+            yield from self._listen_future
+        except asyncio.CancelledError:
+            pass
+        logger.info('disconnecting gracefully')
+
+    @asyncio.coroutine
+    def disconnect(self):
+        """Gracefully disconnect from the server.
+
+        When disconnection is complete, Client.connect will return.
+        """
+        self._listen_future.cancel()
+
+    @asyncio.coroutine
+    def set_active(self):
+        """Set this client as active.
+
+        While a client is active, no other clients will raise notifications.
+        Call this method whenever there is an indication the user is
+        interacting with this client. This method may be called very
+        frequently, and it will only make a request when necessary.
+        """
+        is_active = (self._active_client_state ==
+                     schemas.ActiveClientState.IS_ACTIVE_CLIENT)
+        timed_out = (time.time() - self._last_active_secs >
+                     SETACTIVECLIENT_LIMIT_SECS)
+        if not is_active or timed_out:
+            # Update these immediately so if the function is called again
+            # before the API request finishes, we don't start extra requests.
+            self._active_client_state = (
+                schemas.ActiveClientState.IS_ACTIVE_CLIENT
+            )
+            self._last_active_secs = time.time()
+            try:
+                yield from self.setactiveclient(True, ACTIVE_TIMEOUT_SECS)
+            except exceptions.NetworkError as e:
+                logger.warning('Failed to set active client: {}'.format(e))
+            else:
+                logger.info('Set active client for {} seconds'
+                            .format(ACTIVE_TIMEOUT_SECS))
 
     ##########################################################################
     # Private methods
     ##########################################################################
 
-    @gen.coroutine
-    def _sync_chat_messages(self):
-        """Sync chat messages since self._sync_timestamp."""
-        logger.info('Syncing messages since {}'.format(self._sync_timestamp))
-        res = yield self.syncallnewevents(self._sync_timestamp)
-
-        # Parse chat message from response and fire on_message event for each
-        # new chat message.
-        conversation_state = res[3]
-        for conv in conversation_state:
-            events = conv[2]
-            for msg in events:
-                try:
-                    ev_notif = schemas.CLIENT_EVENT_NOTIFICATION.parse([msg])
-                except ValueError as e:
-                    logger.warning('Failed to parse ClientEvent: {}'.format(e))
-                else:
-                    # Workaround for syncallnewevents timestamp being
-                    # inclusive:
-                    timestamp = parsers.from_timestamp(ev_notif.event.timestamp)
-                    if timestamp > self._sync_timestamp:
-                        self.on_event_notification.fire(ev_notif)
-
-        self._sync_timestamp = parsers.from_timestamp(int(res[1][4]))
-
-    @gen.coroutine
+    @asyncio.coroutine
     def _initialize_chat(self):
         """Request push channel creation and initial chat data.
 
@@ -150,12 +168,25 @@ class Client(object):
         containing JavaScript objects. We need to parse the objects to get at
         the data.
         """
+        # We first need to fetch the 'pvt' token, which is required for the
+        # initialization request (otherwise it will return 400).
         try:
-            res = yield http_utils.fetch(
-                CHAT_INIT_URL, cookies=self._cookies, params=CHAT_INIT_PARAMS,
-                connect_timeout=CONNECT_TIMEOUT, request_timeout=REQUEST_TIMEOUT
+            res = yield from http_utils.fetch(
+                'get', PVT_TOKEN_URL, cookies=self._cookies,
+                connector=self._connector
             )
-        except httpclient.HTTPError as e:
+            CHAT_INIT_PARAMS['pvt'] = javascript.loads(res.body.decode())[1]
+            logger.info('Found PVT token: {}'.format(CHAT_INIT_PARAMS['pvt']))
+        except (exceptions.NetworkError, ValueError) as e:
+            raise exceptions.HangupsError('Failed to fetch PVT token: {}'
+                                          .format(e))
+        # Now make the actual initialization request:
+        try:
+            res = yield from http_utils.fetch(
+                'get', CHAT_INIT_URL, cookies=self._cookies,
+                params=CHAT_INIT_PARAMS, connector=self._connector
+            )
+        except exceptions.NetworkError as e:
             raise exceptions.HangupsError('Initialize chat request failed: {}'
                                           .format(e))
 
@@ -175,14 +206,11 @@ class Client(object):
         # Extract various values that we will need.
         try:
             self._api_key = data_dict['ds:7'][0][2]
+            self._email = data_dict['ds:34'][0][2]
             self._header_date = data_dict['ds:2'][0][4]
             self._header_version = data_dict['ds:2'][0][6]
             self._header_id = data_dict['ds:4'][0][7]
-            self._channel_path = data_dict['ds:4'][0][1]
-            self._clid = data_dict['ds:4'][0][7]
-            self._channel_ec_param = data_dict['ds:4'][0][4]
-            self._channel_prop_param = data_dict['ds:4'][0][5]
-            self._sync_timestamp = parsers.from_timestamp(
+            _sync_timestamp = parsers.from_timestamp(
                 data_dict['ds:21'][0][1][4]
             )
         except KeyError as e:
@@ -222,16 +250,7 @@ class Client(object):
             ))
 
         return InitialData(initial_conv_states, self_entity, initial_entities,
-                           initial_conv_parts)
-
-    def _get_authorization_header(self):
-        """Return autorization header for chat API request."""
-        # technically, it doesn't matter what the url and time are
-        time_msec = int(time.time() * 1000)
-        auth_string = '{} {} {}'.format(time_msec, self._get_cookie("SAPISID"),
-                                        ORIGIN_URL)
-        auth_hash = hashlib.sha1(auth_string.encode()).hexdigest()
-        return 'SAPISIDHASH {}_{}'.format(time_msec, auth_hash)
+                           initial_conv_parts, _sync_timestamp)
 
     def _get_cookie(self, name):
         """Return a cookie for raise error if that cookie was not provided."""
@@ -243,31 +262,36 @@ class Client(object):
     def _get_request_header(self):
         """Return request header for chat API request."""
         return [
-            [3, 3, self._header_version, self._header_date],
-            [self._header_client, self._header_id],
+            [6, 3, self._header_version, self._header_date],
+            [self._client_id, self._header_id],
             None,
             "en"
         ]
 
+    @asyncio.coroutine
     def _on_push_data(self, submission):
         """Parse ClientStateUpdate and call the appropriate events."""
         for state_update in parsers.parse_submission(submission):
-            if state_update.event_notification is not None:
-                self._sync_timestamp = parsers.from_timestamp(
-                    state_update.event_notification.event.timestamp
+            if isinstance(state_update, dict) and 'client_id' in state_update:
+                # Hack to receive client ID:
+                self._client_id = state_update['client_id']
+                logger.info('Received new client_id: {}'
+                            .format(self._client_id))
+            else:
+                self._active_client_state = (
+                    state_update.state_update_header.active_client_state
                 )
-            self.on_state_update.fire(state_update)
+                yield from self.on_state_update.fire(state_update)
 
-    @gen.coroutine
+    @asyncio.coroutine
     def _request(self, endpoint, body_json, use_json=True):
-        """Make chat API request."""
+        """Make chat API request.
+
+        Raises hangups.NetworkError if the request fails.
+        """
         url = 'https://clients6.google.com/chat/v1/{}'.format(endpoint)
-        headers = {
-            'authorization': self._get_authorization_header(),
-            'x-origin': ORIGIN_URL,
-            'x-goog-authuser': '0',
-            'content-type': 'application/json+protobuf',
-        }
+        headers = channel.get_authorization_headers(self._get_cookie('SAPISID'))
+        headers['content-type'] = 'application/json+protobuf'
         required_cookies = ['SAPISID', 'HSID', 'SSID', 'APISID', 'SID']
         cookies = {cookie: self._get_cookie(cookie)
                    for cookie in required_cookies}
@@ -275,89 +299,19 @@ class Client(object):
             'key': self._api_key,
             'alt': 'json' if use_json else 'protojson',
         }
-        res = yield http_utils.fetch(
-            url, method='POST', headers=headers, cookies=cookies,
-            params=params, data=json.dumps(body_json),
-            request_timeout=REQUEST_TIMEOUT, connect_timeout=CONNECT_TIMEOUT
+        res = yield from http_utils.fetch(
+            'post', url, headers=headers, cookies=cookies, params=params,
+            data=json.dumps(body_json), connector=self._connector
         )
         logger.debug('Response to request for {} was {}:\n{}'
                      .format(endpoint, res.code, res.body))
-        if res.code != 200:
-            raise ValueError('Request to {} endpoint failed with {}: {}'
-                             .format(endpoint, res.code, res.body.decode()))
         return res
 
-    @gen.coroutine
-    def getselfinfo(self):
-        """Return information about your account."""
-        res = yield self._request('contacts/getselfinfo', [
-            self._get_request_header(),
-            [], []
-        ])
-        return json.loads(res.body.decode())
+    ###########################################################################
+    # Raw API request methods
+    ###########################################################################
 
-    @gen.coroutine
-    def setfocus(self, conversation_id):
-        """Set focus (occurs whenever you give focus to a client)."""
-        res = yield self._request('conversations/setfocus', [
-            self._get_request_header(),
-            [conversation_id],
-            1,
-            20
-        ])
-        return json.loads(res.body.decode())
-
-    @gen.coroutine
-    def searchentities(self, search_string, max_results):
-        """Search for people."""
-        res = yield self._request('contacts/searchentities', [
-            self._get_request_header(),
-            [],
-            search_string,
-            max_results
-        ])
-        return json.loads(res.body.decode())
-
-    @gen.coroutine
-    def querypresence(self, chat_id):
-        """Check someone's presence status."""
-        res = yield self._request('presence/querypresence', [
-            self._get_request_header(),
-            [
-                [chat_id]
-            ],
-            [1, 2, 5, 7, 8]
-        ])
-        return json.loads(res.body.decode())
-
-    @gen.coroutine
-    def getentitybyid(self, chat_id_list):
-        """Return information about a list of contacts."""
-        res = yield self._request('contacts/getentitybyid', [
-            self._get_request_header(),
-            None,
-            [[str(chat_id)] for chat_id in chat_id_list],
-        ])
-        return json.loads(res.body.decode())
-
-    @gen.coroutine
-    def getconversation(self, conversation_id, num_events,
-                        storage_continuation_token, event_timestamp):
-        """Return data about a conversation.
-
-        Seems to require both a timestamp and a token from a previous event
-        """
-        res = yield self._request('conversations/getconversation', [
-            self._get_request_header(),
-            [
-                [conversation_id], [], []
-            ],
-            True, True, None, num_events,
-            [None, storage_continuation_token, event_timestamp]
-        ])
-        return json.loads(res.body.decode())
-
-    @gen.coroutine
+    @asyncio.coroutine
     def syncallnewevents(self, timestamp):
         """List all events occuring at or after timestamp.
 
@@ -368,43 +322,324 @@ class Client(object):
         which to return all events occuring in.
 
         Raises hangups.NetworkError if the request fails.
+
+        Returns a ClientSyncAllNewEventsResponse.
         """
+        res = yield from self._request('conversations/syncallnewevents', [
+            self._get_request_header(),
+            # last_sync_timestamp
+            parsers.to_timestamp(timestamp),
+            [], None, [], False, [],
+            1048576 # max_response_size_bytes
+        ], use_json=False)
         try:
-            res = yield self._request('conversations/syncallnewevents', [
-                self._get_request_header(),
-                int(timestamp.timestamp()) * 1000000,
-                [], None, [], False, [],
-                1048576 # max response size? (number of bytes in a MB)
-            ], use_json=False)
-        except (httpclient.HTTPError, IOError) as e:
-            # In addition to HTTPError, httpclient can raise IOError (which
-            # includes socker.gaierror).
-            raise exceptions.NetworkError(e)
+            res = schemas.CLIENT_SYNC_ALL_NEW_EVENTS_RESPONSE.parse(
+                javascript.loads(res.body.decode())
+            )
+        except ValueError as e:
+            raise exceptions.NetworkError('Response failed to parse: {}'
+                                          .format(e))
         # can return 200 but still contain an error
-        res = javascript.loads(res.body.decode())
-        res_status = res[1][0]
-        if res_status != 1:
+        status = res.response_header.status
+        if status != 1:
             raise exceptions.NetworkError('Response status is \'{}\''
-                                          .format(res_status))
+                                          .format(status))
         return res
 
-    @gen.coroutine
+    @asyncio.coroutine
+    def sendchatmessage(self, conversation_id, segments):
+        """Send a chat message to a conversation.
+
+        conversation_id must be a valid conversation ID. segments must be a
+        list of message segments to send, in pblite format.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        client_generated_id = random.randint(0, 2**32)
+        body = [
+            self._get_request_header(),
+            None, None, None, [],
+            [
+                segments, []
+            ],
+            None,
+            [
+                [conversation_id], client_generated_id, 2
+            ],
+            None, None, None, []
+        ]
+        res = yield from self._request('conversations/sendchatmessage', body)
+        # sendchatmessage can return 200 but still contain an error
+        res = json.loads(res.body.decode())
+        res_status = res['response_header']['status']
+        if res_status != 'OK':
+            raise exceptions.NetworkError('Unexpected status: {}'
+                                          .format(res_status))
+
+    @asyncio.coroutine
+    def setactiveclient(self, is_active, timeout_secs):
+        """Set the active client.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('clients/setactiveclient', [
+            self._get_request_header(),
+            # is_active: whether the client is active or not
+            is_active,
+            # full_jid: user@domain/resource
+            "{}/{}".format(self._email, self._client_id),
+            # timeout_secs: timeout in seconds for this client to be active
+            timeout_secs
+        ])
+        res = json.loads(res.body.decode())
+        res_status = res['response_header']['status']
+        if res_status != 'OK':
+            raise exceptions.NetworkError('Unexpected status: {}'
+                                          .format(res_status))
+
+    ###########################################################################
+    # UNUSED raw API request methods (by hangups itself) for reference
+    ###########################################################################
+
+    @asyncio.coroutine
+    def removeuser(self, conversation_id):
+        """Leave group conversation.
+
+        conversation_id must be a valid conversation ID.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        client_generated_id = random.randint(0, 2**32)
+        res = yield from self._request('conversations/removeuser', [
+            self._get_request_header(),
+            None, None, None,
+            [
+                [conversation_id], client_generated_id, 2
+            ],
+        ])
+        res = json.loads(res.body.decode())
+        res_status = res['response_header']['status']
+        if res_status != 'OK':
+            raise exceptions.NetworkError('Unexpected status: {}'
+                                          .format(res_status))
+
+    @asyncio.coroutine
+    def deleteconversation(self, conversation_id):
+        """Delete one-to-one conversation.
+
+        conversation_id must be a valid conversation ID.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('conversations/deleteconversation', [
+            self._get_request_header(),
+            [conversation_id],
+            # Not sure what timestamp should be there, last time I have tried it
+            # Hangouts client in GMail sent something like now() - 5 hours
+            parsers.to_timestamp(
+                datetime.datetime.now(tz=datetime.timezone.utc)
+            ),
+            None, [],
+        ])
+        res = json.loads(res.body.decode())
+        res_status = res['response_header']['status']
+        if res_status != 'OK':
+            raise exceptions.NetworkError('Unexpected status: {}'
+                                          .format(res_status))
+
+    @asyncio.coroutine
+    def settyping(self, conversation_id, typing=schemas.TypingStatus.TYPING):
+        """Send typing notification.
+
+        conversation_id must be a valid conversation ID.
+        typing must be a hangups.TypingStatus Enum.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('conversations/settyping', [
+            self._get_request_header(),
+            [conversation_id],
+            typing.value
+        ])
+        res = json.loads(res.body.decode())
+        res_status = res['response_header']['status']
+        if res_status != 'OK':
+            raise exceptions.NetworkError('Unexpected status: {}'
+                                          .format(res_status))
+
+    @asyncio.coroutine
+    def updatewatermark(self, conv_id, read_timestamp):
+        """Update the watermark (read timestamp) for a conversation.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('conversations/updatewatermark', [
+            self._get_request_header(),
+            # conversation_id
+            [conv_id],
+            # latest_read_timestamp
+            parsers.to_timestamp(read_timestamp),
+        ])
+        res = json.loads(res.body.decode())
+        res_status = res['response_header']['status']
+        if res_status != 'OK':
+            raise exceptions.NetworkError('Unexpected status: {}'
+                                          .format(res_status))
+
+    @asyncio.coroutine
+    def getselfinfo(self):
+        """Return information about your account.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('contacts/getselfinfo', [
+            self._get_request_header(),
+            [], []
+        ])
+        return json.loads(res.body.decode())
+
+    @asyncio.coroutine
+    def setfocus(self, conversation_id):
+        """Set focus (occurs whenever you give focus to a client).
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('conversations/setfocus', [
+            self._get_request_header(),
+            [conversation_id],
+            1,
+            20
+        ])
+        return json.loads(res.body.decode())
+
+    @asyncio.coroutine
+    def searchentities(self, search_string, max_results):
+        """Search for people.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('contacts/searchentities', [
+            self._get_request_header(),
+            [],
+            search_string,
+            max_results
+        ])
+        return json.loads(res.body.decode())
+
+    @asyncio.coroutine
+    def setpresence(self, online, mood=None):
+        """Set the presence or mood of this client.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('presence/setpresence', [
+            self._get_request_header(),
+            [
+                # timeout_secs timeout in seconds for this presence
+                720,
+                # client_presence_state:
+                # 40 => DESKTOP_ACTIVE
+                # 30 => DESKTOP_IDLE
+                # 1 => NONE
+                1 if online else 40,
+            ],
+            None,
+            None,
+            # True if going offline, False if coming online
+            [not online],
+            # UTF-8 smiley like 0x1f603
+            [mood],
+        ])
+        res = json.loads(res.body.decode())
+        res_status = res['response_header']['status']
+        if res_status != 'OK':
+            raise exceptions.NetworkError('Unexpected status: {}'
+                                          .format(res_status))
+
+    @asyncio.coroutine
+    def querypresence(self, chat_id):
+        """Check someone's presence status.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('presence/querypresence', [
+            self._get_request_header(),
+            [
+                [chat_id]
+            ],
+            [1, 2, 5, 7, 8]
+        ])
+        return json.loads(res.body.decode())
+
+    @asyncio.coroutine
+    def getentitybyid(self, chat_id_list):
+        """Return information about a list of contacts.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('contacts/getentitybyid', [
+            self._get_request_header(),
+            None,
+            [[str(chat_id)] for chat_id in chat_id_list],
+        ])
+        return json.loads(res.body.decode())
+
+    @asyncio.coroutine
+    def getconversation(self, conversation_id, event_timestamp, max_events=50):
+        """Return conversation events.
+
+        This is mainly used for retrieving conversation scrollback. Events
+        occurring before event_timestamp are returned, in order from oldest to
+        newest.
+
+        Raises hangups.NetworkError if the request fails.
+        """
+        res = yield from self._request('conversations/getconversation', [
+            self._get_request_header(),
+            [[conversation_id], [], []],  # conversationSpec
+            False,  # includeConversationMetadata
+            True,  # includeEvents
+            None,  # ???
+            max_events,  # maxEventsPerConversation
+            # eventContinuationToken (specifying timestamp is sufficient)
+            [
+                None,  # eventId
+                None,  # storageContinuationToken
+                parsers.to_timestamp(event_timestamp),  # eventTimestamp
+            ]
+        ], use_json=False)
+        try:
+            res = schemas.CLIENT_GET_CONVERSATION_RESPONSE.parse(
+                javascript.loads(res.body.decode())
+            )
+        except ValueError as e:
+            raise exceptions.NetworkError('Response failed to parse: {}'
+                                          .format(e))
+        # can return 200 but still contain an error
+        status = res.response_header.status
+        if status != 1:
+            raise exceptions.NetworkError('Response status is \'{}\''
+                                          .format(status))
+        return res
+
+    @asyncio.coroutine
     def syncrecentconversations(self):
         """List the contents of recent conversations, including messages.
 
         Similar to syncallnewevents, but appears to return a limited number of
         conversations (20) rather than all conversations in a given date range.
+
+        Raises hangups.NetworkError if the request fails.
         """
-        res = yield self._request('conversations/syncrecentconversations', [
-            self._get_request_header(),
-        ])
+        res = yield from self._request('conversations/syncrecentconversations',
+                                       [self._get_request_header()])
         return json.loads(res.body.decode())
 
-    @gen.coroutine
+    @asyncio.coroutine
     def setchatname(self, conversation_id, name):
         """Set the name of a conversation.
 
-        Raises hangups.NetworkError if the request can not be sent.
+        Raises hangups.NetworkError if the request fails.
         """
         client_generated_id = random.randint(0, 2 ** 32)
         body = [
@@ -414,13 +649,7 @@ class Client(object):
             None,
             [[conversation_id], client_generated_id, 1]
         ]
-        try:
-            res = yield self._request('conversations/renameconversation', body)
-        except (httpclient.HTTPError, IOError) as e:
-            # In addition to HTTPError, httpclient can raise IOError (which
-            # includes socker.gaierror).
-            logger.warning('Failed to send message: {}'.format(e))
-            raise exceptions.NetworkError(e)
+        res = yield from self._request('conversations/renameconversation', body)
         res = json.loads(res.body.decode())
         res_status = res['response_header']['status']
         if res_status != 'OK':
@@ -428,44 +657,24 @@ class Client(object):
                            .format(res_status))
             raise exceptions.NetworkError()
 
-    @gen.coroutine
-    def sendchatmessage(self, conversation_id, message, is_bold=False,
-                        is_italic=False, is_strikethrough=False,
-                        is_underlined=False):
-        """Send a chat message to a conversation.
+    @asyncio.coroutine
+    def sendeasteregg(self, conversation_id, easteregg):
+        """Send a easteregg to a conversation.
 
-        message may not be empty.
+        easteregg may not be empty.
 
-        Raises hangups.NetworkError if the message can not be sent.
+        Raises hangups.NetworkError if the request fails.
         """
-        client_generated_id = random.randint(0, 2**32)
         body = [
             self._get_request_header(),
-            None, None, None, [],
-            [
-                [
-                    [0, message, [is_bold, is_italic, is_strikethrough,
-                                  is_underlined]]
-                ],
-                []
-            ],
-            None,
-            [
-                [conversation_id], client_generated_id, 2
-            ],
-            None, None, None, []
+            [conversation_id],
+            [easteregg, None, 1]
         ]
-        try:
-            res = yield self._request('conversations/sendchatmessage', body)
-        except (httpclient.HTTPError, IOError) as e:
-            # In addition to HTTPError, httpclient can raise IOError (which
-            # includes socker.gaierror).
-            logger.warning('Failed to send message: {}'.format(e))
-            raise exceptions.NetworkError(e)
-        # sendchatmessage can return 200 but still contain an error
+        res = yield from self._request('conversations/easteregg', body)
         res = json.loads(res.body.decode())
         res_status = res['response_header']['status']
         if res_status != 'OK':
-            logger.warning('sendchatmessage returned status {}'
+            logger.warning('easteregg returned status {}'
                            .format(res_status))
             raise exceptions.NetworkError()
+

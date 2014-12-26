@@ -1,6 +1,12 @@
-import sys
 from setuptools import setup
 from setuptools.command.test import test as TestCommand
+import os
+import sys
+
+# Find __version__ without import that requires dependencies to be installed:
+exec(open(os.path.join(
+    os.path.dirname(__file__), 'hangups/version.py'
+)).read())
 
 
 class PyTest(TestCommand):
@@ -20,7 +26,7 @@ with open('README.rst') as f:
 
 setup(
     name='hangups',
-    version='0.1.3',
+    version=__version__,
     description=('the first third-party instant messaging client for Google '
                  'Hangouts'),
     long_description=readme,
@@ -37,14 +43,17 @@ setup(
         'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
     ],
-    packages=['hangups'],
+    packages=['hangups', 'hangups.ui'],
     install_requires=[
         'purplex==0.2.4',
-        'tornado==3.2.1',
         'requests==2.2.1',
-        'urwid==1.2.1',
         'appdirs==1.3.0',
+        'aiohttp==0.9.1',
+        # use forked urwid to allow easy installation of version with asyncio
+        'hangups-urwid==1.2.2-dev',
+        # Backports for py3.3:
         'enum34==1.0',
+        'asyncio==3.4.1',
     ],
     tests_require=[
         'pytest',
@@ -52,7 +61,7 @@ setup(
     cmdclass={'test': PyTest},
     entry_points={
         'console_scripts': [
-            'hangups=hangups.__main__:main',
+            'hangups=hangups.ui.__main__:main',
         ],
     },
 )
